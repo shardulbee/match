@@ -1,0 +1,7 @@
+builder.py
+match.zig
+setup.py
+match.egg-info/PKG-INFO
+match.egg-info/SOURCES.txt
+match.egg-info/dependency_links.txt
+match.egg-info/top_level.txt
