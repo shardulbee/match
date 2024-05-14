@@ -5,7 +5,6 @@ const py = @cImport({
 
 const std = @import("std");
 const match_impl = @import("match_impl.zig");
-const tensor_impl = @import("tensor.zig");
 
 const PyObject = py.PyObject;
 const PyModuleDef = py.PyModuleDef;
@@ -53,7 +52,7 @@ fn tensor(self: [*c]PyObject, args: [*c]PyObject) callconv(.C) [*c]PyObject {
     return PyTensor_FromTensor(ret);
 }
 
-fn uniform(_: [*c]PyObject, args: [*c]PyObject) callconv(.C) [*c]PyObject {
+fn uniform_f64(_: [*c]PyObject, args: [*c]PyObject) callconv(.C) [*c]PyObject {
     var shape: [*c]py.PyObject = undefined;
 
     if (py.PyArg_ParseTuple(args, "O", &shape) != 1) {
@@ -77,32 +76,12 @@ fn uniform(_: [*c]PyObject, args: [*c]PyObject) callconv(.C) [*c]PyObject {
         tensor_shape[idx] = py.PyLong_AsUnsignedLong(py.PyTuple_GetItem(shape, @intCast(idx)));
     }
 
-    const tens = match_impl.uniform(f64, tensor_shape, allocator.*) catch {
+    const ret = match_impl.uniform(f64, tensor_shape, allocator.*) catch {
         allocator.free(tensor_shape);
         return null;
     };
 
-    return PyTensor_FromTensorInternal(f64, &tens);
-}
-
-fn tolist(self: [*c]PyObject, _: [*c]PyObject) callconv(.C) [*c]PyObject {
-    const obj: [*c]PyTensorObject = @ptrCast(self);
-    if (obj == null) {
-        return null;
-    }
-
-    var list: [*c]py.PyObject = py.PyList_New(@intCast(obj.*.len));
-
-    if (list == null) {
-        py.PyErr_SetString(py.PyExc_RuntimeError, "unable to create list");
-        return null;
-    }
-
-    for (0..obj.*.len) |idx| {
-        std.debug.print("idx: {}\n", .{idx});
-        list = py.PyList_SetItem(list, @intCast(idx), py.PyFloat_FromDouble(obj.*.data[idx]));
-    }
-    return list;
+    return PyTensor_FromTensor(f64, ret); // fix this to the new thing
 }
 
 // array of methods in the module
@@ -113,11 +92,12 @@ var MatchMethods = [_]PyMethodDef{
         .ml_flags = METH_VARARGS,
         .ml_doc = "Creates a tensor object",
     },
+
     PyMethodDef{
-        .ml_name = "uniform",
-        .ml_meth = uniform,
+        .ml_name = "uniform_f64",
+        .ml_meth = uniform_f64,
         .ml_flags = METH_VARARGS,
-        .ml_doc = "Create a tensor which is uniformly distributed in [0, 1)",
+        .ml_doc = "Create a tensor of f64 which is uniformly distributed in [0, 1)",
     },
 
     // need to end the array with a null PyMethodDef
@@ -130,13 +110,9 @@ var MatchMethods = [_]PyMethodDef{
     },
 };
 
-const PyTensorObject = extern struct { ob_base: py.PyObject, data: [*]const f64, len: usize };
+const PyTensorObject = extern struct { ob_base: py.PyObject, data: [*]f64, len: usize };
 
-fn PyTensorObjectComptime(comptime dtype: type) type {
-    return extern struct { ob_base: py.PyObject, tensor: *const tensor_impl.Tensor(dtype) };
-}
-
-pub fn PyTensor_FromTensor(tensor_data: []const f64) [*c]PyObject {
+pub fn PyTensor_FromTensor(tensor_data: []f64) [*c]PyObject {
     const ptr = PyTensorType.tp_alloc.?(&PyTensorType, 0);
 
     const obj: [*c]PyTensorObject = @ptrCast(ptr);
@@ -146,18 +122,6 @@ pub fn PyTensor_FromTensor(tensor_data: []const f64) [*c]PyObject {
 
     obj.*.data = tensor_data.ptr;
     obj.*.len = tensor_data.len;
-    return @ptrCast(obj);
-}
-
-pub fn PyTensor_FromTensorInternal(comptime dtype: type, tens: *const tensor_impl.Tensor(dtype)) [*c]PyObject {
-    const ptr = PyTensorType.tp_alloc.?(&PyTensorType, 0);
-
-    const obj: [*c]PyTensorObjectComptime(dtype) = @ptrCast(ptr);
-    if (obj == null) {
-        return null;
-    }
-
-    obj.*.tensor = tens;
     return @ptrCast(obj);
 }
 
@@ -269,21 +233,6 @@ fn tensor_sum(self: [*c]PyObject, args: [*c]PyObject, kwords: [*c]PyObject) call
     return py.PyFloat_FromDouble(sum);
 }
 
-fn tensor_getitem(_: [*c]PyObject, args: [*c]PyObject) callconv(.C) [*c]PyObject {
-    var index: [*c]PyObject = undefined;
-
-    // parse index as a long integer
-    if (py.PyArg_ParseTuple(args, "l", &index) != 1) {
-        py.PyErr_SetString(py.PyExc_TypeError, "index must be an integer");
-        return null;
-    }
-
-    if (py.PyLong_Check(index) != 1) {
-        py.PyErr_SetString(py.PyExc_TypeError, "index must be an integer");
-        return null;
-    }
-}
-
 var TensorMethods = [_]PyMethodDef{
     // PyMethodDef{
     //     .ml_name = "sum",
@@ -291,13 +240,6 @@ var TensorMethods = [_]PyMethodDef{
     //     .ml_meth = &tensor_sum,
     //     .ml_doc = "Sum a tensor",
     // },
-    // need to end the array with a null PyMethodDef
-    PyMethodDef{
-        .ml_name = "tolist",
-        .ml_flags = py.METH_NOARGS,
-        .ml_meth = &tolist,
-        .ml_doc = "Convert the tensor back to a python list",
-    },
     // need to end the array with a null PyMethodDef
     // this is how the CPython API knows when to stop looking for methods
     PyMethodDef{
