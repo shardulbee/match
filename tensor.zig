@@ -16,7 +16,10 @@ pub fn Tensor(comptime T: type) type {
             var strides: []usize = try allocator.alloc(usize, shape.len);
             var shapes: []usize = try allocator.alloc(usize, shape.len);
             const copied_data: []T = try allocator.alloc(T, data.len);
-            @memcpy(copied_data, data);
+            // copy data into the new tensor
+            for (data, 0..) |item, i| {
+                copied_data[i] = item;
+            }
 
             var i: usize = data.len;
             for (shape, 0..) |dim, idx| {
@@ -39,6 +42,17 @@ pub fn Tensor(comptime T: type) type {
                 .len = data.len,
                 .stride = strides,
                 .shape = shapes,
+                .allocator = allocator,
+            };
+        }
+
+        // init a tensor from heap allocated data
+        pub fn init_zerocopy(ndim: usize, data: [*]T, shape: [*]usize, strides: [*]usize, len: usize, allocator: std.mem.Allocator) Tensor(T) {
+            return Tensor(T){
+                .data = data[0..len],
+                .len = len,
+                .stride = strides[0..ndim],
+                .shape = shape[0..ndim],
                 .allocator = allocator,
             };
         }
@@ -69,6 +83,30 @@ pub fn Tensor(comptime T: type) type {
 
         pub fn reshape(self: Tensor(T), shape: []const usize) !Tensor(T) {
             return Tensor(T).init(self.data, shape, self.allocator);
+        }
+
+        pub fn sum(self: Tensor(T)) T {
+            // https://developer.apple.com/documentation/accelerate/simd/double-precision_floating-point_vectors
+            // it seems like on an M3 max, we can get 8 doubles in a SIMD register
+            // so we can sum 8 doubles at a time
+            const num_vecs: usize = self.len / 8;
+            const remainder: usize = self.len % 8;
+
+            // sum the SIMD vectors together
+            var simd_sum: @Vector(8, T) = @splat(0.0);
+            for (0..num_vecs) |i| {
+                const vec: @Vector(8, T) = self.data[i * 8 ..][0..8].*;
+                simd_sum += vec;
+            }
+
+            // sum the summed SIMD vector
+            var ret: T = @reduce(.Add, simd_sum);
+
+            // sum the floats which could not fit inside a 8 element SIMD vector to the final sum
+            for (self.data[num_vecs * 8 .. num_vecs * 8 + remainder]) |item| {
+                ret += item;
+            }
+            return ret;
         }
 
         pub fn equal(self: Tensor(T), other: Tensor(T)) bool {

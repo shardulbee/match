@@ -5,6 +5,7 @@ const py = @cImport({
 
 const std = @import("std");
 const match_impl = @import("match_impl.zig");
+const tensor_impl = @import("tensor.zig");
 
 const PyObject = py.PyObject;
 const PyModuleDef = py.PyModuleDef;
@@ -14,91 +15,75 @@ const METH_VARARGS = py.METH_VARARGS;
 const METH_KEYWORDS = py.METH_KEYWORDS;
 const PyModuleDef_Base = py.PyModuleDef_Base;
 
-var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-var allocator = &arena.allocator();
+const allocator = &std.heap.page_allocator;
 
-fn tensor(self: [*c]PyObject, args: [*c]PyObject) callconv(.C) [*c]PyObject {
-    _ = self;
-    var pylist: [*c]py.PyObject = undefined;
-
-    if (py.PyArg_ParseTuple(args, "O", &pylist) != 1) {
-        py.PyErr_SetString(py.PyExc_ValueError, "unable to parse list");
-        return null;
-    }
-
-    if (py.PyList_Check(pylist) != 1) {
-        py.PyErr_SetString(py.PyExc_TypeError, "argument must be a list");
-        return null;
-    }
-
-    const size = py.PyList_Size(pylist);
-    if (size < 0) {
-        py.PyErr_SetString(py.PyExc_ValueError, "len(list) must be >= 0.");
-        return null;
-    }
-
-    var ret = allocator.alloc(f64, @intCast(size)) catch return null;
-
-    var item: [*c]py.PyObject = undefined;
-    for (0..@intCast(size)) |idx| {
-        item = py.PyList_GetItem(pylist, @intCast(idx));
-
-        if (py.PyFloat_Check(item) != 1) {
-            py.PyErr_SetString(py.PyExc_TypeError, "list items must be floats.");
-            return null;
-        }
-        ret[idx] = py.PyFloat_AsDouble(item);
-    }
-    return PyTensor_FromTensor(ret);
-}
+// create parse error
+const ParseError = error{ ParseError, AllocError };
 
 fn uniform_f64(_: [*c]PyObject, args: [*c]PyObject) callconv(.C) [*c]PyObject {
+    const shape: []usize = parse_shape(args) catch return null;
+
+    const ret = match_impl.uniform(f64, shape, allocator.*) catch {
+        allocator.free(shape);
+        return null;
+    };
+
+    const tens = PyTensor_FromTensor(f64, &ret);
+    return @ptrCast(tens);
+}
+
+fn uniform_f32(_: [*c]PyObject, args: [*c]PyObject) callconv(.C) [*c]PyObject {
+    const shape: []usize = parse_shape(args) catch return null;
+
+    const ret = match_impl.uniform(f32, shape, allocator.*) catch {
+        allocator.free(shape);
+        return null;
+    };
+
+    const tens = PyTensor_FromTensor(f32, &ret);
+    return @ptrCast(tens);
+}
+
+fn parse_shape(args: [*c]py.PyObject) error{ ParseError, AllocError }![]usize {
     var shape: [*c]py.PyObject = undefined;
 
     if (py.PyArg_ParseTuple(args, "O", &shape) != 1) {
         py.PyErr_SetString(py.PyExc_ValueError, "unable to parse shape argument");
-        return null;
+        return ParseError.ParseError;
     }
 
     if (py.PyTuple_Check(shape) != 1) {
         py.PyErr_SetString(py.PyExc_TypeError, "shape argument must be a list");
-        return null;
+        return ParseError.ParseError;
     }
 
     const size: isize = py.PyTuple_Size(shape);
     if (size < 0) {
         py.PyErr_SetString(py.PyExc_ValueError, "len(shape) must be >= 0.");
-        return null;
+        return ParseError.ParseError;
     }
 
-    var tensor_shape: []usize = allocator.alloc(usize, @intCast(size)) catch return null;
+    var tensor_shape: []usize = allocator.alloc(usize, @intCast(size)) catch return error.AllocError;
     for (0..@intCast(size)) |idx| {
         tensor_shape[idx] = py.PyLong_AsUnsignedLong(py.PyTuple_GetItem(shape, @intCast(idx)));
     }
-
-    const ret = match_impl.uniform(f64, tensor_shape, allocator.*) catch {
-        allocator.free(tensor_shape);
-        return null;
-    };
-
-    return PyTensor_FromTensor(f64, ret); // fix this to the new thing
+    return tensor_shape;
 }
 
 // array of methods in the module
 var MatchMethods = [_]PyMethodDef{
-    PyMethodDef{
-        .ml_name = "tensor",
-        .ml_meth = tensor,
-        .ml_flags = METH_VARARGS,
-        .ml_doc = "Creates a tensor object",
-    },
-
     PyMethodDef{
         .ml_name = "uniform_f64",
         .ml_meth = uniform_f64,
         .ml_flags = METH_VARARGS,
         .ml_doc = "Create a tensor of f64 which is uniformly distributed in [0, 1)",
     },
+    PyMethodDef{
+        .ml_name = "uniform_f32",
+        .ml_meth = uniform_f32,
+        .ml_flags = METH_VARARGS,
+        .ml_doc = "Create a tensor of f32 which is uniformly distributed in [0, 1)",
+    },
 
     // need to end the array with a null PyMethodDef
     // this is how the CPython API knows when to stop looking for methods
@@ -110,164 +95,114 @@ var MatchMethods = [_]PyMethodDef{
     },
 };
 
-const PyTensorObject = extern struct { ob_base: py.PyObject, data: [*]f64, len: usize };
+fn PyTensorObject(comptime dtype: type) type {
+    return extern struct {
+        ob_base: py.PyObject,
 
-pub fn PyTensor_FromTensor(tensor_data: []f64) [*c]PyObject {
-    const ptr = PyTensorType.tp_alloc.?(&PyTensorType, 0);
+        data: [*]const dtype,
+        len: usize,
+        stride: [*]const usize,
+        shape: [*]const usize,
+        dtype: [*]const u8,
+        ndim: usize,
+    };
+}
 
-    const obj: [*c]PyTensorObject = @ptrCast(ptr);
-    if (obj == null) {
+pub fn PyTensor_AsTensor(comptime dtype: type, obj: [*c]PyObject) tensor_impl.Tensor(dtype) {
+    const py_tensor_object: *const PyTensorObject(dtype) = @ptrCast(obj);
+    const as_tensor = tensor_impl.Tensor(dtype).init_zerocopy(py_tensor_object.ndim, @constCast(py_tensor_object.data[0..py_tensor_object.len].ptr), @constCast(py_tensor_object.shape[0..py_tensor_object.ndim].ptr), @constCast(py_tensor_object.stride[0..py_tensor_object.ndim].ptr), py_tensor_object.len, allocator.*);
+    return as_tensor;
+}
+
+pub fn PyTensor_FromTensor(comptime dtype: type, tensor_data: *const tensor_impl.Tensor(dtype)) [*c]py.PyObject {
+    const type_object: *const py.PyTypeObject = switch (dtype) {
+        f64 => PyTensorF64.type_object,
+        f32 => PyTensorF32.type_object,
+        else => unreachable,
+    };
+    const alloc_fn = type_object.*.tp_alloc.?;
+
+    const ptr: [*c]PyObject = alloc_fn(@constCast(type_object), 0);
+    if (ptr == null) {
         return null;
     }
 
-    obj.*.data = tensor_data.ptr;
+    const obj: *PyTensorObject(dtype) = @ptrCast(ptr);
+    obj.*.data = tensor_data.data.ptr;
     obj.*.len = tensor_data.len;
+    obj.*.stride = tensor_data.stride.ptr;
+    obj.*.shape = tensor_data.shape.ptr;
+    obj.*.dtype = @ptrCast(@typeName(dtype));
+    obj.*.ndim = tensor_data.shape.len;
     return @ptrCast(obj);
 }
 
-fn tensor_repr(self: [*c]PyObject) callconv(.C) [*c]PyObject {
-    const obj: [*c]PyTensorObject = @ptrCast(self);
-    if (obj == null) {
-        return null;
-    }
+fn PyTensor(comptime dtype: type) type {
+    return struct {
+        type_object: *const py.PyTypeObject,
 
-    const tens = obj.*.data[0..obj.*.len];
-    return py.PyUnicode_FromFormat("<match.tensor with %d elements>", tens.len);
+        pub fn init() PyTensor(dtype) {
+            return PyTensor(dtype){
+                .type_object = &py.PyTypeObject{
+                    .ob_base = py.PyVarObject{
+                        .ob_base = py.PyObject{
+                            .ob_refcnt = std.math.maxInt(isize),
+                            .ob_type = null,
+                        },
+                        .ob_size = 0,
+                    },
+                    .tp_name = "match.tensor",
+                    .tp_basicsize = @sizeOf(PyTensorObject(dtype)),
+                    .tp_doc = "A PyMatch tensor class",
+                    .tp_alloc = py.PyType_GenericAlloc,
+                    .tp_free = free,
+                    // .tp_dealloc = tensor_free, // TODO: implement a generic free
+                    .tp_repr = tensor_repr,
+                    .tp_methods = @constCast(&[_]PyMethodDef{
+                        PyMethodDef{
+                            .ml_name = "sum",
+                            .ml_meth = sum,
+                            .ml_flags = METH_VARARGS,
+                            .ml_doc = "Sum a tensor",
+                        },
+                        PyMethodDef{
+                            .ml_name = null,
+                            .ml_meth = null,
+                            .ml_flags = 0,
+                            .ml_doc = null,
+                        },
+                    }),
+                },
+            };
+        }
+
+        pub fn free(self: ?*anyopaque) callconv(.C) void {
+            if (self == null) {
+                return;
+            }
+            const obj: *PyTensorObject(dtype) = @ptrCast(@alignCast(self));
+            allocator.free(obj.data[0..obj.len]);
+            allocator.free(obj.stride[0..obj.ndim]);
+            allocator.free(obj.shape[0..obj.ndim]);
+        }
+
+        pub fn tensor_repr(self: [*c]PyObject) callconv(.C) [*c]PyObject {
+            const obj: *PyTensorObject(dtype) = @ptrCast(self);
+            const as_tensor = PyTensor_AsTensor(dtype, self);
+            std.debug.print("tensor as tensor len: {any}\n", .{as_tensor.len});
+            std.debug.print("tensor as c obj len: {any}\n", .{obj.len});
+            return py.PyUnicode_FromFormat("<match.tensor with %d elements with dtype=%s>", obj.len, @typeName(dtype));
+        }
+
+        pub fn sum(self: [*c]PyObject, _: [*c]PyObject) callconv(.C) [*c]PyObject {
+            const as_tensor = PyTensor_AsTensor(dtype, self);
+            return py.PyFloat_FromDouble(as_tensor.sum());
+        }
+    };
 }
 
-fn match_sum_impl(tens: [*c]PyTensorObject) f64 {
-    const floats = tens.*.data[0..tens.*.len];
-    var sum: f64 = 0.0;
-    for (floats) |item| {
-        sum += item;
-    }
-    return sum;
-}
-
-fn match_sum_impl_simd(tens: [*c]PyTensorObject) !f64 {
-    // https://developer.apple.com/documentation/accelerate/simd/double-precision_floating-point_vectors
-    // it seems like on an M3 max, we can get 8 doubles in a SIMD register
-    // so we can sum 8 doubles at a time
-
-    const floats = tens.*.data[0..tens.*.len];
-    const num_vecs: usize = tens.*.len / 8;
-    const remainder: usize = tens.*.len % 8;
-
-    // sum the SIMD vectors together
-    var simd_sum: @Vector(8, f64) = @Vector(8, f64){ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
-    for (0..num_vecs) |i| {
-        const vec: @Vector(8, f64) = floats[i * 8 ..][0..8].*;
-        simd_sum += vec;
-    }
-
-    // sum the summed SIMD vector
-    var sum: f64 = @reduce(.Add, simd_sum);
-
-    // sum the floats which could not fit inside a 8 element SIMD vector to the final sum
-    for (floats[num_vecs * 8 .. num_vecs * 8 + remainder]) |item| {
-        sum += item;
-    }
-    return sum;
-}
-
-fn match_sum(_: [*c]PyObject, args: [*c]PyObject) callconv(.C) [*c]PyObject {
-    var simd_bool: [*c]PyObject = undefined;
-    var input: [*c]PyObject = undefined;
-
-    if (py.PyArg_ParseTuple(args, "OO", &input, &simd_bool) != 1) {
-        py.PyErr_SetString(py.PyExc_ValueError, "unable to arguments");
-        return null;
-    }
-
-    if (py.PyBool_Check(simd_bool) != 1) {
-        py.PyErr_SetString(py.PyExc_TypeError, "second argument must be a boolean");
-        return null;
-    }
-
-    if (py.PyObject_TypeCheck(input, &PyTensorType) != 1) {
-        py.PyErr_SetString(py.PyExc_TypeError, "first argument must be a tensor");
-        return null;
-    }
-
-    const obj: [*c]PyTensorObject = @ptrCast(input);
-    if (obj == null) {
-        return null;
-    }
-
-    var sum: f64 = 0.0;
-    if (py.PyObject_IsTrue(simd_bool) == 1) {
-        sum = match_sum_impl_simd(obj) catch return null;
-    } else {
-        sum = match_sum_impl(obj);
-    }
-    return py.PyFloat_FromDouble(sum);
-}
-
-fn tensor_sum(self: [*c]PyObject, args: [*c]PyObject, kwords: [*c]PyObject) callconv(.C) [*c]PyObject {
-    var simd: [*c]PyObject = undefined;
-
-    var keywords = [2][]const u8{ "simd", undefined };
-    const keyword_list: [*c][*c]u8 = @ptrCast(keywords[0..].ptr);
-
-    if (py.PyArg_ParseTupleAndKeywords(args, kwords, "O", keyword_list, &simd) != 1) {
-        py.PyErr_SetString(py.PyExc_ValueError, "unable to parse boolean argument");
-        return null;
-    }
-
-    if (py.PyBool_Check(simd) != 1) {
-        py.PyErr_SetString(py.PyExc_TypeError, "argument must be a boolean");
-        return null;
-    }
-
-    const obj: [*c]PyTensorObject = @ptrCast(self);
-    if (obj == null) {
-        return null;
-    }
-
-    var sum: f64 = 0.0;
-    if (py.PyObject_IsTrue(simd) == 1) {
-        sum = match_sum_impl_simd(obj) catch return null;
-    } else {
-        sum = match_sum_impl(obj);
-    }
-    return py.PyFloat_FromDouble(sum);
-}
-
-var TensorMethods = [_]PyMethodDef{
-    // PyMethodDef{
-    //     .ml_name = "sum",
-    //     .ml_flags = METH_VARARGS | METH_KEYWORDS,
-    //     .ml_meth = &tensor_sum,
-    //     .ml_doc = "Sum a tensor",
-    // },
-    // need to end the array with a null PyMethodDef
-    // this is how the CPython API knows when to stop looking for methods
-    PyMethodDef{
-        .ml_name = null,
-        .ml_meth = null,
-        .ml_flags = 0,
-        .ml_doc = null,
-    },
-};
-
-fn tensor_free(self: [*c]PyObject) callconv(.C) void {
-    const obj: [*c]PyTensorObject = @ptrCast(self);
-    if (obj == null) {
-        return;
-    }
-
-    allocator.free(obj.*.data[0..obj.*.len]);
-}
-
-var PyTensorType = py.PyTypeObject{
-    .ob_base = py.PyVarObject{ .ob_size = 0 },
-    .tp_name = "match.tensor",
-    .tp_basicsize = @bitSizeOf(PyTensorObject),
-    .tp_doc = "A PyMatch tensor class",
-    .tp_repr = tensor_repr,
-    .tp_dealloc = tensor_free,
-    .tp_methods = &TensorMethods,
-};
+const PyTensorF64: PyTensor(f64) = PyTensor(f64).init();
+const PyTensorF32: PyTensor(f32) = PyTensor(f32).init();
 
 // module definition
 var matchmodule = PyModuleDef{
@@ -291,8 +226,12 @@ var matchmodule = PyModuleDef{
 };
 
 pub export fn PyInit_match() [*]PyObject {
-    if (py.PyType_Ready(&PyTensorType) != 0) {
-        py.PyErr_SetString(py.PyExc_RuntimeError, "unable to tensor module");
+    if (py.PyType_Ready(@constCast(PyTensorF64.type_object)) != 0) {
+        py.PyErr_SetString(py.PyExc_RuntimeError, "unable to initialize f64 tensor type");
+    }
+    //
+    if (py.PyType_Ready(@constCast(PyTensorF32.type_object)) != 0) {
+        py.PyErr_SetString(py.PyExc_RuntimeError, "unable to initialize f32 tensor type");
     }
 
     return PyModuleCreate(&matchmodule);
