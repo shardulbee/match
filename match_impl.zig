@@ -1,7 +1,13 @@
 const tensor = @import("tensor.zig");
 const std = @import("std");
 
-const Error = error{ dimension_mismatch, unimplemented };
+const Error = error{ dimension_mismatch, unimplemented, allocator_error };
+
+pub const MulStrategy = enum {
+    naive,
+    loop_reorder,
+    simd,
+};
 
 // only supports integers > 0
 fn arange(comptime dtype: type, start: usize, stop: usize, shape: []const usize, allocator: std.mem.Allocator) !tensor.Tensor(dtype) {
@@ -71,33 +77,153 @@ test "uniform" {
     }
 }
 
-fn mul(comptime dtype: type, a: tensor.Tensor(dtype), b: tensor.Tensor(dtype), allocator: std.mem.Allocator) !tensor.Tensor(dtype) {
+pub fn mul(comptime dtype: type, a: tensor.Tensor(dtype), b: tensor.Tensor(dtype), allocator: std.mem.Allocator, strategy: MulStrategy) error{ dimension_mismatch, unimplemented, allocator_error }!tensor.Tensor(dtype) {
+    switch (strategy) {
+        .naive => return mul_naive(dtype, a, b, allocator),
+        .loop_reorder => return mul_loop_reorder(dtype, a, b, allocator),
+        .simd => return mul_simd(dtype, a, b, allocator),
+    }
+}
+
+pub fn mul_simd(comptime dtype: type, a: tensor.Tensor(dtype), b: tensor.Tensor(dtype), allocator: std.mem.Allocator) error{ dimension_mismatch, unimplemented, allocator_error }!tensor.Tensor(dtype) {
+    if (a.shape[a.shape.len - 1] != b.shape[0]) {
+        return error.dimension_mismatch;
+    }
+
+    if (a.shape.len != 2 or b.shape.len != 2) {
+        return error.unimplemented;
+    }
+
+    const output_length = a.shape[0] * b.shape[1];
+    var data = allocator.alloc(dtype, output_length) catch return error.allocator_error;
+    @memset(data, 0);
+
+    // TODO: implement as SIMD
+    // for (0..a.shape[0]) |i| {
+    //     for (0..a.shape[1]) |k| {
+    //         for (0..b.shape[1]) |j| {
+    //             const lhs = a.getitem(&[_]usize{ i, k }) catch return error.unimplemented;
+    //             const rhs = b.getitem(&[_]usize{ k, j }) catch return error.unimplemented;
+    //             data[i * b.shape[1] + j] += lhs * rhs;
+    //         }
+    //     }
+    // }
+    //
+
+    const n_vec: usize = a.shape[0] / 8; // how many SIMD products we do per row of a / col of b
+    const remainder: usize = a.shape[0] % 8; // how many elements are left over
+
+    if (remainder != 0) {
+        std.debug.print("we do not support matrix dimensions which are not divisible by 8\n", .{});
+        return error.unimplemented;
+    }
+
+    for (0..a.shape[0]) |i| {
+        for (0..b.shape[1]) |j| {
+            var simd_sum: @Vector(8, dtype) = @splat(0.0);
+            for (0..n_vec) |k| {
+                // we want the kth group of 8 elements of the ith row of a
+                // to get the start of the ith row of a, we do i * a.stride[0]
+                // and then we add k * 8 to get the start of the kth group of 8 elements
+                // of the ith row of a
+                // so we do i * a.stride[0] + k * 8
+                // and then we get the first 8 elements of the result
+                const lhs: @Vector(8, dtype) = a.data[i * a.stride[0] + k * 8 ..][0..8].*;
+
+                // to get the nth element of the jth column of b, we do n * b.stride[0] + j
+                var rhs: @Vector(8, dtype) = @splat(0.0);
+                for (0..8) |kk| {
+                    rhs[kk] = b.data[(k * 8 + kk) * b.stride[0] + j];
+                }
+
+                simd_sum += lhs * rhs;
+            }
+
+            data[i * b.shape[1] + j] = @reduce(.Add, simd_sum);
+        }
+    }
+
+    const tens = tensor.Tensor(dtype).init(data, &[_]usize{ a.shape[0], b.shape[1] }, allocator) catch {
+        allocator.free(data);
+        return error.unimplemented;
+    };
+    allocator.free(data);
+    return tens;
+}
+
+pub fn mul_loop_reorder(comptime dtype: type, a: tensor.Tensor(dtype), b: tensor.Tensor(dtype), allocator: std.mem.Allocator) error{ dimension_mismatch, unimplemented, allocator_error }!tensor.Tensor(dtype) {
+    if (a.shape[a.shape.len - 1] != b.shape[0]) {
+        return error.dimension_mismatch;
+    }
+
+    if (a.shape.len != 2 or b.shape.len != 2) {
+        return error.unimplemented;
+    }
+
+    const output_length = a.shape[0] * b.shape[1];
+    var data = allocator.alloc(dtype, output_length) catch return error.allocator_error;
+    @memset(data, 0);
+
+    for (0..a.shape[0]) |i| {
+        for (0..a.shape[1]) |k| {
+            for (0..b.shape[1]) |j| {
+                // a.stride[0] is how many elements you need to skip to get to the next row
+                // since we need the ith row of a, we need to skip i * a.stride[0] elements and then get the kth col
+                const lhs = a.data[i * a.stride[0] + k];
+
+                // b.stride[0] is how many elements you need to skip to get to the next row
+                // we need all elements of the jth column of b
+                // so we need to skip k * b.stride[0] elements every time
+                // and then get the jth element
+                const rhs = b.data[k * b.stride[0] + j];
+                data[i * b.shape[1] + j] += lhs * rhs;
+            }
+        }
+    }
+
+    const tens = tensor.Tensor(dtype).init(data, &[_]usize{ a.shape[0], b.shape[1] }, allocator) catch {
+        allocator.free(data);
+        return error.unimplemented;
+    };
+    allocator.free(data);
+    return tens;
+}
+
+pub fn mul_naive(comptime dtype: type, a: tensor.Tensor(dtype), b: tensor.Tensor(dtype), allocator: std.mem.Allocator) error{ dimension_mismatch, unimplemented, allocator_error }!tensor.Tensor(dtype) {
     // check last dimension of a matches first dimension of b
     if (a.shape[a.shape.len - 1] != b.shape[0]) {
         return error.dimension_mismatch;
     }
 
     if (a.shape.len != 2 or b.shape.len != 2) {
-        return error.unsupported;
+        return error.unimplemented;
     }
 
     const output_length = a.shape[0] * b.shape[1];
-    var data = try allocator.alloc(dtype, output_length);
+    var data = allocator.alloc(dtype, output_length) catch return error.allocator_error;
+    @memset(data, 0);
 
     // WE'RE DOING IT BABY
     for (0..a.shape[0]) |i| {
         for (0..b.shape[1]) |j| {
-            var sum: dtype = 0;
             for (0..a.shape[1]) |k| {
-                sum += try a.getitem(&[_]usize{ i, k }) * try b.getitem(&[_]usize{ k, j });
+                // a.stride[0] is how many elements you need to skip to get to the next row
+                // since we need the ith row of a, we need to skip i * a.stride[0] elements and then get the kth col
+                const lhs = a.data[i * a.stride[0] + k];
+
+                // b.stride[0] is how many elements you need to skip to get to the next row
+                // we need all elements of the jth column of b
+                // so we need to skip k * b.stride[0] elements every time
+                // and then get the jth element
+                const rhs = b.data[k * b.stride[0] + j];
+                data[i * b.shape[1] + j] += lhs * rhs;
             }
-            data[i * b.shape[1] + j] = sum;
         }
     }
 
-    const tens = tensor.Tensor(dtype).init(data, &[_]usize{ a.shape[0], b.shape[1] }, allocator) catch |err| {
+    const tens = tensor.Tensor(dtype).init(data, &[_]usize{ a.shape[0], b.shape[1] }, allocator) catch {
         allocator.free(data);
-        return err;
+        return error.unimplemented;
     };
     allocator.free(data);
     return tens;
@@ -113,7 +239,7 @@ test "mul" {
     const b = try arange(f32, 1, 10, shape, allocator);
     defer b.deinit(allocator);
 
-    const c = try mul(f32, a, b, allocator);
+    const c = try mul(f32, a, b, allocator, .naive);
     defer c.deinit(allocator);
 
     // assert dim is correct

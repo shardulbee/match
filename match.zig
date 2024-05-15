@@ -84,6 +84,12 @@ var MatchMethods = [_]PyMethodDef{
         .ml_flags = METH_VARARGS,
         .ml_doc = "Create a tensor of f32 which is uniformly distributed in [0, 1)",
     },
+    PyMethodDef{
+        .ml_name = "mul_f64",
+        .ml_meth = mul_f64,
+        .ml_flags = METH_VARARGS,
+        .ml_doc = "Multiply two f64 tensors",
+    },
 
     // need to end the array with a null PyMethodDef
     // this is how the CPython API knows when to stop looking for methods
@@ -135,6 +141,69 @@ pub fn PyTensor_FromTensor(comptime dtype: type, tensor_data: *const tensor_impl
     obj.*.dtype = @ptrCast(@typeName(dtype));
     obj.*.ndim = tensor_data.shape.len;
     return @ptrCast(obj);
+}
+
+pub fn mul_f64(_: [*c]PyObject, args: [*c]PyObject) callconv(.C) [*c]PyObject {
+    var first_arg: [*c]PyObject = undefined;
+    var second_arg: [*c]PyObject = undefined;
+    var strategy: [*c]PyObject = undefined;
+
+    if (py.PyArg_ParseTuple(args, "OOO", &first_arg, &second_arg, &strategy) != 1) {
+        py.PyErr_SetString(py.PyExc_ValueError, "unable to parse arguments");
+        return null;
+    }
+
+    if (py.PyObject_TypeCheck(first_arg, @constCast(PyTensorF64.type_object)) != 1) {
+        py.PyErr_SetString(py.PyExc_TypeError, "first argument must be a f64 tensor");
+        return null;
+    }
+
+    if (py.PyObject_TypeCheck(second_arg, @constCast(PyTensorF64.type_object)) != 1) {
+        py.PyErr_SetString(py.PyExc_TypeError, "second argument must be a f64 tensor");
+        return null;
+    }
+
+    if (py.PyUnicode_Check(strategy) != 1) {
+        py.PyErr_SetString(py.PyExc_TypeError, "strategy argument must be a string");
+        return null;
+    }
+
+    const strategy_str = py.PyUnicode_AsUTF8(strategy);
+    const length: usize = @intCast(py.PyUnicode_GetLength(strategy));
+
+    var strategy_arg: match_impl.MulStrategy = undefined;
+    if (std.mem.eql(u8, strategy_str[0..length], "naive")) {
+        strategy_arg = match_impl.MulStrategy.naive;
+    } else if (std.mem.eql(u8, strategy_str[0..length], "loop_reorder")) {
+        strategy_arg = match_impl.MulStrategy.loop_reorder;
+    } else if (std.mem.eql(u8, strategy_str[0..length], "simd")) {
+        strategy_arg = match_impl.MulStrategy.simd;
+    } else {
+        py.PyErr_SetString(py.PyExc_ValueError, "strategy must be 'naive' or 'loop_reorder'");
+        return null;
+    }
+
+    const first_tensor: tensor_impl.Tensor(f64) = PyTensor_AsTensor(f64, first_arg);
+    const second_tensor: tensor_impl.Tensor(f64) = PyTensor_AsTensor(f64, second_arg);
+
+    // mul will allocate memory for the result
+    const result = match_impl.mul(f64, first_tensor, second_tensor, allocator.*, strategy_arg) catch |err| {
+        switch (err) {
+            error.dimension_mismatch => {
+                py.PyErr_SetString(py.PyExc_ValueError, "dimension mismatch");
+                return null;
+            },
+            error.unimplemented => {
+                py.PyErr_SetString(py.PyExc_ValueError, "unimplemented");
+                return null;
+            },
+            else => {
+                unreachable;
+            },
+        }
+    };
+
+    return PyTensor_FromTensor(f64, &result);
 }
 
 fn PyTensor(comptime dtype: type) type {
