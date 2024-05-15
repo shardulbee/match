@@ -241,6 +241,75 @@ test "mul_simd_reorder" {
     try std.testing.expectEqualDeep(&[_]usize{ 1024, 1024 }, c.shape);
 }
 
+test "simd_reorder correctness" {
+    // assume that the naive implementation is correct
+    const allocator = std.testing.allocator;
+    const shape = &[_]usize{ 1024, 1024 };
+
+    const a = try uniform(f64, shape, allocator);
+    defer a.deinit(allocator);
+
+    const b = try uniform(f64, shape, allocator);
+    defer b.deinit(allocator);
+
+    const c_simd = try mul(f64, a, b, allocator, .simd_reorder);
+    defer c_simd.deinit(allocator);
+
+    const c_naive = try mul(f64, a, b, allocator, .naive);
+    defer c_naive.deinit(allocator);
+
+    try std.testing.expectEqualDeep(&[_]usize{ 1024, 1024 }, c_simd.shape);
+    try std.testing.expectEqualDeep(&[_]usize{ 1024, 1024 }, c_naive.shape);
+
+    try std.testing.expectEqualDeep(c_simd, c_naive);
+}
+
+test "simd correctness" {
+    // assume that the naive implementation is correct
+    const allocator = std.testing.allocator;
+    const shape = &[_]usize{ 1024, 1024 };
+
+    const a = try uniform(f64, shape, allocator);
+    defer a.deinit(allocator);
+
+    const b = try uniform(f64, shape, allocator);
+    defer b.deinit(allocator);
+
+    const c_simd = try mul(f64, a, b, allocator, .simd);
+    defer c_simd.deinit(allocator);
+
+    const c_naive = try mul(f64, a, b, allocator, .naive);
+    defer c_naive.deinit(allocator);
+
+    try std.testing.expectEqualDeep(&[_]usize{ 1024, 1024 }, c_simd.shape);
+    try std.testing.expectEqualDeep(&[_]usize{ 1024, 1024 }, c_naive.shape);
+
+    try std.testing.expectEqualDeep(c_simd, c_naive);
+}
+
+test "reorder correctness" {
+    // assume that the naive implementation is correct
+    const allocator = std.testing.allocator;
+    const shape = &[_]usize{ 1024, 1024 };
+
+    const a = try uniform(f64, shape, allocator);
+    defer a.deinit(allocator);
+
+    const b = try uniform(f64, shape, allocator);
+    defer b.deinit(allocator);
+
+    const c_reorder = try mul(f64, a, b, allocator, .loop_reorder);
+    defer c_reorder.deinit(allocator);
+
+    const c_naive = try mul(f64, a, b, allocator, .naive);
+    defer c_naive.deinit(allocator);
+
+    try std.testing.expectEqualDeep(&[_]usize{ 1024, 1024 }, c_reorder.shape);
+    try std.testing.expectEqualDeep(&[_]usize{ 1024, 1024 }, c_naive.shape);
+
+    try std.testing.expectEqualDeep(c_reorder, c_naive);
+}
+
 pub fn mul_loop_reorder(comptime dtype: type, a: tensor.Tensor(dtype), b: tensor.Tensor(dtype), allocator: std.mem.Allocator) error{ dimension_mismatch, unimplemented, allocator_error }!tensor.Tensor(dtype) {
     if (a.shape[a.shape.len - 1] != b.shape[0]) {
         return error.dimension_mismatch;
