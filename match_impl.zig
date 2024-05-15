@@ -7,6 +7,7 @@ pub const MulStrategy = enum {
     naive,
     loop_reorder,
     simd,
+    simd_reorder,
 };
 
 // only supports integers > 0
@@ -82,6 +83,7 @@ pub fn mul(comptime dtype: type, a: tensor.Tensor(dtype), b: tensor.Tensor(dtype
         .naive => return mul_naive(dtype, a, b, allocator),
         .loop_reorder => return mul_loop_reorder(dtype, a, b, allocator),
         .simd => return mul_simd(dtype, a, b, allocator),
+        .simd_reorder => return mul_simd_reorder(dtype, a, b, allocator),
     }
 }
 
@@ -149,6 +151,94 @@ pub fn mul_simd(comptime dtype: type, a: tensor.Tensor(dtype), b: tensor.Tensor(
     };
     allocator.free(data);
     return tens;
+}
+
+pub fn mul_simd_reorder(comptime dtype: type, a: tensor.Tensor(dtype), b: tensor.Tensor(dtype), allocator: std.mem.Allocator) error{ dimension_mismatch, unimplemented, allocator_error }!tensor.Tensor(dtype) {
+    if (a.shape[a.shape.len - 1] != b.shape[0]) {
+        return error.dimension_mismatch;
+    }
+
+    if (a.shape.len != 2 or b.shape.len != 2) {
+        return error.unimplemented;
+    }
+
+    const output_length = a.shape[0] * b.shape[1];
+
+    const n_vec: usize = b.shape[1] / 8; // how many SIMD products we do per row of a / col of b
+    const remainder: usize = b.shape[1] % 8; // how many elements are left over
+
+    if (remainder != 0) {
+        std.debug.print("we do not support matrix dimensions which are not divisible by 8\n", .{});
+        return error.unimplemented;
+    }
+
+    // allocate a 2d array of vectors
+    var ret = allocator.alloc(dtype, output_length) catch return error.allocator_error;
+    var data: []@Vector(8, dtype) = allocator.alloc(@Vector(8, dtype), a.shape[0] * n_vec) catch return error.allocator_error;
+    @memset(data, @splat(0));
+
+    // iterate over rows of A
+    for (0..a.shape[0]) |i| {
+        // iterate over cols of A
+        for (0..a.shape[1]) |k| {
+            const lhs: @Vector(8, dtype) = @splat(a.data[i * a.stride[0] + k]);
+            // iterate over the kth row of B, chunk, and scalar multiply, then add to the ith row of C
+            for (0..n_vec) |j| {
+                // we want the jth group of 8 elements of the kth row of B
+                // kth row of B is k * b.stride[0]
+                // jth group of 8 elements is j * 8
+                const rhs: @Vector(8, dtype) = b.data[(k * b.stride[0] + j * 8)..][0..8].*;
+                data[i * n_vec + j] += lhs * rhs;
+            }
+        }
+    }
+
+    for (0..a.shape[0]) |i| {
+        for (0..n_vec) |j| {
+            // number of vecs per row is b.shape[1] / 8
+            const vec: @Vector(8, dtype) = data[i * b.shape[1] / 8 + j];
+            for (0..8) |kk| {
+                ret[(i * b.shape[1] + j * 8 + kk)] = vec[kk];
+            }
+        }
+    }
+
+    const tens = tensor.Tensor(dtype).init(ret, &[_]usize{ a.shape[0], b.shape[1] }, allocator) catch {
+        allocator.free(data);
+        return error.unimplemented;
+    };
+    allocator.free(ret);
+    allocator.free(data);
+    return tens;
+}
+
+test "mul_simd_reorder" {
+    const allocator = std.testing.allocator;
+    const shape = &[_]usize{ 1024, 1024 };
+
+    const a = try uniform(f64, shape, allocator);
+    defer a.deinit(allocator);
+
+    const b = try uniform(f64, shape, allocator);
+    defer b.deinit(allocator);
+
+    const c = mul(f64, a, b, allocator, .simd_reorder) catch |err| {
+        switch (err) {
+            error.dimension_mismatch => {
+                return;
+            },
+            error.unimplemented => {
+                return;
+            },
+            else => {
+                unreachable;
+            },
+        }
+    };
+    defer c.deinit(allocator);
+
+    // assert dim is correct
+    try std.testing.expectEqualDeep(&[_]usize{ 1024, 1024 }, c.shape);
 }
 
 pub fn mul_loop_reorder(comptime dtype: type, a: tensor.Tensor(dtype), b: tensor.Tensor(dtype), allocator: std.mem.Allocator) error{ dimension_mismatch, unimplemented, allocator_error }!tensor.Tensor(dtype) {

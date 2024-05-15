@@ -178,6 +178,8 @@ pub fn mul_f64(_: [*c]PyObject, args: [*c]PyObject) callconv(.C) [*c]PyObject {
         strategy_arg = match_impl.MulStrategy.loop_reorder;
     } else if (std.mem.eql(u8, strategy_str[0..length], "simd")) {
         strategy_arg = match_impl.MulStrategy.simd;
+    } else if (std.mem.eql(u8, strategy_str[0..length], "simd_reorder")) {
+        strategy_arg = match_impl.MulStrategy.simd_reorder;
     } else {
         py.PyErr_SetString(py.PyExc_ValueError, "strategy must be 'naive' or 'loop_reorder'");
         return null;
