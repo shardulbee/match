@@ -3,3 +3,4 @@ __pycache__/*
 .venv/
 libmatch.dylib
 match.cpython-311-darwin.so
+match.egg-info/
