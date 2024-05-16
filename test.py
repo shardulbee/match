@@ -25,10 +25,12 @@ def test_mul():
     n_iters = 10
 
     # benchmarks
-    numpy_time = timeit.timeit(lambda: np.matmul(numpy_lhs, numpy_rhs), number=n_iters)
+    numpy_time = timeit.timeit(lambda: np.matmul(
+        numpy_lhs, numpy_rhs), number=n_iters)
     print(f"numpy mul: {numpy_time/n_iters} seconds per iteration")
 
-    torch_time = timeit.timeit(lambda: t.matmul(torch_lhs, torch_rhs), number=n_iters)
+    torch_time = timeit.timeit(lambda: t.matmul(
+        torch_lhs, torch_rhs), number=n_iters)
     print(f"torch mul: {torch_time/n_iters} seconds per iteration")
 
     # torch_time = timeit.timeit(
@@ -50,7 +52,8 @@ def test_mul():
         match_time = timeit.timeit(
             lambda: match.mul_f64(match_lhs, match_rhs, strategy), number=n_iters
         )
-        print(f"zig mul ({strategy}): {match_time/n_iters} seconds per iteration")
+        print(
+            f"zig mul ({strategy}): {match_time/n_iters} seconds per iteration")
 
 
 if __name__ == "__main__":
