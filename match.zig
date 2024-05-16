@@ -21,11 +21,18 @@ const allocator = &std.heap.page_allocator;
 const ParseError = error{ ParseError, AllocError };
 
 fn uniform_f64(_: [*c]PyObject, args: [*c]PyObject) callconv(.C) [*c]PyObject {
-    const shape: []usize = parse_shape(args) catch return null;
+    const shape: []usize = parse_shape(args) catch return null; // TODO: set python exception
 
-    const ret = match_impl.uniform(f64, shape, allocator.*) catch {
+    var data_len: usize = 1;
+    for (shape) |s| {
+        data_len *= s;
+    }
+    const buffer = allocator.alloc(f64, data_len) catch return null; // TODO: set python exception
+
+    const ret = match_impl.uniform(f64, shape, buffer) catch {
         allocator.free(shape);
-        return null;
+        allocator.free(buffer);
+        return null; // TODO: set python exception
     };
 
     const tens = PyTensor_FromTensor(f64, &ret);
@@ -33,11 +40,18 @@ fn uniform_f64(_: [*c]PyObject, args: [*c]PyObject) callconv(.C) [*c]PyObject {
 }
 
 fn uniform_f32(_: [*c]PyObject, args: [*c]PyObject) callconv(.C) [*c]PyObject {
-    const shape: []usize = parse_shape(args) catch return null;
+    const shape: []usize = parse_shape(args) catch return null; // TODO: set python exception
 
-    const ret = match_impl.uniform(f32, shape, allocator.*) catch {
+    var data_len: usize = 1;
+    for (shape) |s| {
+        data_len *= s;
+    }
+    const buffer = allocator.alloc(f32, data_len) catch return null; // TODO: set python exception
+
+    const ret = match_impl.uniform(f32, shape, buffer) catch {
         allocator.free(shape);
-        return null;
+        allocator.free(buffer);
+        return null; // TODO: set python exception
     };
 
     const tens = PyTensor_FromTensor(f32, &ret);
@@ -107,7 +121,6 @@ fn PyTensorObject(comptime dtype: type) type {
 
         data: [*]const dtype,
         len: usize,
-        stride: [*]const usize,
         shape: [*]const usize,
         dtype: [*]const u8,
         ndim: usize,
@@ -116,7 +129,10 @@ fn PyTensorObject(comptime dtype: type) type {
 
 pub fn PyTensor_AsTensor(comptime dtype: type, obj: [*c]PyObject) tensor_impl.Tensor(dtype) {
     const py_tensor_object: *const PyTensorObject(dtype) = @ptrCast(obj);
-    const as_tensor = tensor_impl.Tensor(dtype).init_zerocopy(py_tensor_object.ndim, @constCast(py_tensor_object.data[0..py_tensor_object.len].ptr), @constCast(py_tensor_object.shape[0..py_tensor_object.ndim].ptr), @constCast(py_tensor_object.stride[0..py_tensor_object.ndim].ptr), py_tensor_object.len, allocator.*);
+    const as_tensor = tensor_impl.Tensor(dtype).init(
+        py_tensor_object.data[0..py_tensor_object.len],
+        py_tensor_object.shape[0..py_tensor_object.ndim],
+    );
     return as_tensor;
 }
 
@@ -136,7 +152,6 @@ pub fn PyTensor_FromTensor(comptime dtype: type, tensor_data: *const tensor_impl
     const obj: *PyTensorObject(dtype) = @ptrCast(ptr);
     obj.*.data = tensor_data.data.ptr;
     obj.*.len = tensor_data.len;
-    obj.*.stride = tensor_data.stride.ptr;
     obj.*.shape = tensor_data.shape.ptr;
     obj.*.dtype = @ptrCast(@typeName(dtype));
     obj.*.ndim = tensor_data.shape.len;
@@ -251,17 +266,13 @@ fn PyTensor(comptime dtype: type) type {
             if (self == null) {
                 return;
             }
-            const obj: *PyTensorObject(dtype) = @ptrCast(@alignCast(self));
-            allocator.free(obj.data[0..obj.len]);
-            allocator.free(obj.stride[0..obj.ndim]);
-            allocator.free(obj.shape[0..obj.ndim]);
+            const py_tensor_object: [*c]PyObject = @ptrCast(@alignCast(self));
+
+            PyTensor_AsTensor(dtype, py_tensor_object).deinit(allocator.*);
         }
 
         pub fn tensor_repr(self: [*c]PyObject) callconv(.C) [*c]PyObject {
             const obj: *PyTensorObject(dtype) = @ptrCast(self);
-            const as_tensor = PyTensor_AsTensor(dtype, self);
-            std.debug.print("tensor as tensor len: {any}\n", .{as_tensor.len});
-            std.debug.print("tensor as c obj len: {any}\n", .{obj.len});
             return py.PyUnicode_FromFormat("<match.tensor with %d elements with dtype=%s>", obj.len, @typeName(dtype));
         }
 

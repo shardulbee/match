@@ -10,72 +10,45 @@ pub const MulStrategy = enum {
     simd_reorder,
 };
 
-// only supports integers > 0
-fn arange(comptime dtype: type, start: usize, stop: usize, shape: []const usize, allocator: std.mem.Allocator) !tensor.Tensor(dtype) {
-    const len: usize = stop - start;
-    var data: []dtype = try allocator.alloc(dtype, len);
-    switch (@typeInfo(dtype)) {
-        .Int => {
-            for (start..stop, 0..) |val, i| {
-                data[i] = @intCast(val);
-            }
-        },
-        .Float => {
-            for (start..stop, 0..) |val, i| {
-                data[i] = @floatFromInt(val);
-            }
-        },
-        else => unreachable,
-    }
-
-    const tens = tensor.Tensor(dtype).init(data, shape, allocator) catch |err| {
-        allocator.free(data);
-        return err;
-    };
-    allocator.free(data);
-    return tens;
-}
-
-test "arange" {
-    const allocator = std.testing.allocator;
-    const start: usize = 10;
-    const stop: usize = 19;
-    const tens = try arange(i64, start, stop, &[_]usize{ 3, 3 }, allocator);
-    defer tens.deinit(allocator);
-
-    try std.testing.expectEqual(10, tens.getitem(&[_]usize{ 0, 0 }));
-    try std.testing.expectEqual(11, tens.getitem(&[_]usize{ 0, 1 }));
-}
-
-pub fn uniform(comptime dtype: type, shape: []const usize, allocator: std.mem.Allocator) !tensor.Tensor(dtype) {
-    var size: usize = 1;
-    for (shape) |s| {
-        size *= s;
-    }
-    var data = try allocator.alloc(dtype, size);
+pub fn uniform(comptime dtype: type, shape: []const usize, buffer: []dtype) !tensor.Tensor(dtype) {
     var rng = std.rand.DefaultPrng.init(0);
     var r = rng.random();
-    for (0..data.len) |i| {
-        data[i] = r.float(dtype);
+    for (0..buffer.len) |i| {
+        buffer[i] = r.float(dtype);
     }
-    const tens = tensor.Tensor(dtype).init(data, shape, allocator) catch |err| {
-        allocator.free(data);
-        return err;
-    };
-    allocator.free(data);
-    return tens;
+    return tensor.Tensor(dtype).init(buffer, shape);
 }
 
 test "uniform" {
     const allocator = std.testing.allocator;
-    const tens = try uniform(f32, &[_]usize{1_000_000}, allocator);
-    defer tens.deinit(allocator);
 
-    // want to check all elements are in the range [0, 1)
+    const buffer = try allocator.alloc(f64, 1_024 * 1_024);
+    defer allocator.free(buffer);
+
+    const shape = try allocator.alloc(usize, 2);
+    @memset(shape, 1024);
+    defer allocator.free(shape);
+
+    const tens = try uniform(f64, shape, buffer);
+
     for (0..tens.len) |i| {
-        try std.testing.expect(try tens.getitem(&[_]usize{i}) >= 0);
-        try std.testing.expect(try tens.getitem(&[_]usize{i}) < 1);
+        try std.testing.expect(tens.data[i] >= 0);
+        try std.testing.expect(tens.data[i] < 1);
     }
+}
+
+pub fn identity(comptime dtype: type, shape: []const usize, buffer: []dtype) !tensor.Tensor(dtype) {
+    @memset(buffer, 0);
+
+    // error if not square
+    if (shape[0] != shape[1]) {
+        return error.dimension_mismatch;
+    }
+
+    for (0..shape[0]) |i| {
+        buffer[i * shape[0] + i] = 1;
+    }
+    return tensor.Tensor(dtype).init(buffer, shape);
 }
 
 pub fn mul(comptime dtype: type, a: tensor.Tensor(dtype), b: tensor.Tensor(dtype), allocator: std.mem.Allocator, strategy: MulStrategy) error{ dimension_mismatch, unimplemented, allocator_error }!tensor.Tensor(dtype) {
@@ -95,22 +68,13 @@ pub fn mul_simd(comptime dtype: type, a: tensor.Tensor(dtype), b: tensor.Tensor(
     if (a.shape.len != 2 or b.shape.len != 2) {
         return error.unimplemented;
     }
+    const new_shape = allocator.alloc(usize, 2) catch return error.allocator_error;
+    new_shape[0] = a.shape[0];
+    new_shape[1] = b.shape[1];
 
     const output_length = a.shape[0] * b.shape[1];
     var data = allocator.alloc(dtype, output_length) catch return error.allocator_error;
     @memset(data, 0);
-
-    // TODO: implement as SIMD
-    // for (0..a.shape[0]) |i| {
-    //     for (0..a.shape[1]) |k| {
-    //         for (0..b.shape[1]) |j| {
-    //             const lhs = a.getitem(&[_]usize{ i, k }) catch return error.unimplemented;
-    //             const rhs = b.getitem(&[_]usize{ k, j }) catch return error.unimplemented;
-    //             data[i * b.shape[1] + j] += lhs * rhs;
-    //         }
-    //     }
-    // }
-    //
 
     const n_vec: usize = a.shape[0] / 8; // how many SIMD products we do per row of a / col of b
     const remainder: usize = a.shape[0] % 8; // how many elements are left over
@@ -125,17 +89,17 @@ pub fn mul_simd(comptime dtype: type, a: tensor.Tensor(dtype), b: tensor.Tensor(
             var simd_sum: @Vector(8, dtype) = @splat(0.0);
             for (0..n_vec) |k| {
                 // we want the kth group of 8 elements of the ith row of a
-                // to get the start of the ith row of a, we do i * a.stride[0]
+                // to get the start of the ith row of a, we do i * a.stride(0)
                 // and then we add k * 8 to get the start of the kth group of 8 elements
                 // of the ith row of a
-                // so we do i * a.stride[0] + k * 8
+                // so we do i * a.stride(0) + k * 8
                 // and then we get the first 8 elements of the result
-                const lhs: @Vector(8, dtype) = a.data[i * a.stride[0] + k * 8 ..][0..8].*;
+                const lhs: @Vector(8, dtype) = a.data[i * a.stride(0) + k * 8 ..][0..8].*;
 
-                // to get the nth element of the jth column of b, we do n * b.stride[0] + j
+                // to get the nth element of the jth column of b, we do n * b.stride(0) + j
                 var rhs: @Vector(8, dtype) = @splat(0.0);
                 for (0..8) |kk| {
-                    rhs[kk] = b.data[(k * 8 + kk) * b.stride[0] + j];
+                    rhs[kk] = b.data[(k * 8 + kk) * b.stride(0) + j];
                 }
 
                 simd_sum += lhs * rhs;
@@ -145,12 +109,24 @@ pub fn mul_simd(comptime dtype: type, a: tensor.Tensor(dtype), b: tensor.Tensor(
         }
     }
 
-    const tens = tensor.Tensor(dtype).init(data, &[_]usize{ a.shape[0], b.shape[1] }, allocator) catch {
-        allocator.free(data);
-        return error.unimplemented;
-    };
-    allocator.free(data);
-    return tens;
+    return tensor.Tensor(dtype).init(data, new_shape);
+}
+
+test "mul simd" {
+    const allocator = std.testing.allocator;
+    const shape = &[_]usize{ 1024, 1024 };
+    const buffer = try allocator.alloc(f64, shape[0] * shape[1]);
+    defer allocator.free(buffer);
+
+    const a = try identity(f64, shape, buffer);
+    const b = try identity(f64, shape, buffer);
+
+    const c = try mul_simd(f64, a, b, allocator);
+    defer c.deinit(allocator);
+
+    try std.testing.expectEqualDeep(c.shape, shape);
+    try std.testing.expect(std.mem.eql(f64, a.data, c.data));
+    try std.testing.expect(std.mem.eql(f64, b.data, c.data));
 }
 
 pub fn mul_simd_reorder(comptime dtype: type, a: tensor.Tensor(dtype), b: tensor.Tensor(dtype), allocator: std.mem.Allocator) error{ dimension_mismatch, unimplemented, allocator_error }!tensor.Tensor(dtype) {
@@ -161,6 +137,9 @@ pub fn mul_simd_reorder(comptime dtype: type, a: tensor.Tensor(dtype), b: tensor
     if (a.shape.len != 2 or b.shape.len != 2) {
         return error.unimplemented;
     }
+    const new_shape = allocator.alloc(usize, 2) catch return error.allocator_error;
+    new_shape[0] = a.shape[0];
+    new_shape[1] = b.shape[1];
 
     const output_length = a.shape[0] * b.shape[1];
 
@@ -175,19 +154,20 @@ pub fn mul_simd_reorder(comptime dtype: type, a: tensor.Tensor(dtype), b: tensor
     // allocate a 2d array of vectors
     var ret = allocator.alloc(dtype, output_length) catch return error.allocator_error;
     var data: []@Vector(8, dtype) = allocator.alloc(@Vector(8, dtype), a.shape[0] * n_vec) catch return error.allocator_error;
+    defer allocator.free(data);
     @memset(data, @splat(0));
 
     // iterate over rows of A
     for (0..a.shape[0]) |i| {
         // iterate over cols of A
         for (0..a.shape[1]) |k| {
-            const lhs: @Vector(8, dtype) = @splat(a.data[i * a.stride[0] + k]);
+            const lhs: @Vector(8, dtype) = @splat(a.data[i * a.stride(0) + k]);
             // iterate over the kth row of B, chunk, and scalar multiply, then add to the ith row of C
             for (0..n_vec) |j| {
                 // we want the jth group of 8 elements of the kth row of B
-                // kth row of B is k * b.stride[0]
+                // kth row of B is k * b.stride(0)
                 // jth group of 8 elements is j * 8
-                const rhs: @Vector(8, dtype) = b.data[(k * b.stride[0] + j * 8)..][0..8].*;
+                const rhs: @Vector(8, dtype) = b.data[(k * b.stride(0) + j * 8)..][0..8].*;
                 data[i * n_vec + j] += lhs * rhs;
             }
         }
@@ -203,111 +183,24 @@ pub fn mul_simd_reorder(comptime dtype: type, a: tensor.Tensor(dtype), b: tensor
         }
     }
 
-    const tens = tensor.Tensor(dtype).init(ret, &[_]usize{ a.shape[0], b.shape[1] }, allocator) catch {
-        allocator.free(data);
-        return error.unimplemented;
-    };
-    allocator.free(ret);
-    allocator.free(data);
-    return tens;
+    return tensor.Tensor(dtype).init(ret, new_shape);
 }
 
-test "mul_simd_reorder" {
+test "mul simd_reorder" {
     const allocator = std.testing.allocator;
     const shape = &[_]usize{ 1024, 1024 };
+    const buffer = try allocator.alloc(f64, shape[0] * shape[1]);
+    defer allocator.free(buffer);
 
-    const a = try uniform(f64, shape, allocator);
-    defer a.deinit(allocator);
+    const a = try identity(f64, shape, buffer);
+    const b = try identity(f64, shape, buffer);
 
-    const b = try uniform(f64, shape, allocator);
-    defer b.deinit(allocator);
-
-    const c = mul(f64, a, b, allocator, .simd_reorder) catch |err| {
-        switch (err) {
-            error.dimension_mismatch => {
-                return;
-            },
-            error.unimplemented => {
-                return;
-            },
-            else => {
-                unreachable;
-            },
-        }
-    };
+    const c = try mul_simd_reorder(f64, a, b, allocator);
     defer c.deinit(allocator);
 
-    // assert dim is correct
-    try std.testing.expectEqualDeep(&[_]usize{ 1024, 1024 }, c.shape);
-}
-
-test "simd_reorder correctness" {
-    // assume that the naive implementation is correct
-    const allocator = std.testing.allocator;
-    const shape = &[_]usize{ 1024, 1024 };
-
-    const a = try uniform(f64, shape, allocator);
-    defer a.deinit(allocator);
-
-    const b = try uniform(f64, shape, allocator);
-    defer b.deinit(allocator);
-
-    const c_simd = try mul(f64, a, b, allocator, .simd_reorder);
-    defer c_simd.deinit(allocator);
-
-    const c_naive = try mul(f64, a, b, allocator, .naive);
-    defer c_naive.deinit(allocator);
-
-    try std.testing.expectEqualDeep(&[_]usize{ 1024, 1024 }, c_simd.shape);
-    try std.testing.expectEqualDeep(&[_]usize{ 1024, 1024 }, c_naive.shape);
-
-    try std.testing.expectEqualDeep(c_simd, c_naive);
-}
-
-test "simd correctness" {
-    // assume that the naive implementation is correct
-    const allocator = std.testing.allocator;
-    const shape = &[_]usize{ 1024, 1024 };
-
-    const a = try uniform(f64, shape, allocator);
-    defer a.deinit(allocator);
-
-    const b = try uniform(f64, shape, allocator);
-    defer b.deinit(allocator);
-
-    const c_simd = try mul(f64, a, b, allocator, .simd);
-    defer c_simd.deinit(allocator);
-
-    const c_naive = try mul(f64, a, b, allocator, .naive);
-    defer c_naive.deinit(allocator);
-
-    try std.testing.expectEqualDeep(&[_]usize{ 1024, 1024 }, c_simd.shape);
-    try std.testing.expectEqualDeep(&[_]usize{ 1024, 1024 }, c_naive.shape);
-
-    try std.testing.expectEqualDeep(c_simd, c_naive);
-}
-
-test "reorder correctness" {
-    // assume that the naive implementation is correct
-    const allocator = std.testing.allocator;
-    const shape = &[_]usize{ 1024, 1024 };
-
-    const a = try uniform(f64, shape, allocator);
-    defer a.deinit(allocator);
-
-    const b = try uniform(f64, shape, allocator);
-    defer b.deinit(allocator);
-
-    const c_reorder = try mul(f64, a, b, allocator, .loop_reorder);
-    defer c_reorder.deinit(allocator);
-
-    const c_naive = try mul(f64, a, b, allocator, .naive);
-    defer c_naive.deinit(allocator);
-
-    try std.testing.expectEqualDeep(&[_]usize{ 1024, 1024 }, c_reorder.shape);
-    try std.testing.expectEqualDeep(&[_]usize{ 1024, 1024 }, c_naive.shape);
-
-    try std.testing.expectEqualDeep(c_reorder, c_naive);
+    try std.testing.expectEqualDeep(c.shape, shape);
+    try std.testing.expect(std.mem.eql(f64, a.data, c.data));
+    try std.testing.expect(std.mem.eql(f64, b.data, c.data));
 }
 
 pub fn mul_loop_reorder(comptime dtype: type, a: tensor.Tensor(dtype), b: tensor.Tensor(dtype), allocator: std.mem.Allocator) error{ dimension_mismatch, unimplemented, allocator_error }!tensor.Tensor(dtype) {
@@ -319,33 +212,57 @@ pub fn mul_loop_reorder(comptime dtype: type, a: tensor.Tensor(dtype), b: tensor
         return error.unimplemented;
     }
 
+    const new_shape = allocator.alloc(usize, 2) catch return error.allocator_error;
+    new_shape[0] = a.shape[0];
+    new_shape[1] = b.shape[1];
+
     const output_length = a.shape[0] * b.shape[1];
     var data = allocator.alloc(dtype, output_length) catch return error.allocator_error;
     @memset(data, 0);
 
+    var tempdata = [_]dtype{0} ** 2048;
+
     for (0..a.shape[0]) |i| {
         for (0..a.shape[1]) |k| {
-            for (0..b.shape[1]) |j| {
-                // a.stride[0] is how many elements you need to skip to get to the next row
-                // since we need the ith row of a, we need to skip i * a.stride[0] elements and then get the kth col
-                const lhs = a.data[i * a.stride[0] + k];
+            // initialize a slice of length b.shape[1]
+            // this is the result of multiplying the i,kth element of a by the kth row of b
+            // this gets added to the ith row of the result
 
-                // b.stride[0] is how many elements you need to skip to get to the next row
+            for (0..b.shape[1]) |j| {
+                // a.stride(0) is how many elements you need to skip to get to the next row
+                // since we need the ith row of a, we need to skip i * a.stride(0) elements and then get the kth col
+                // b.stride(0) is how many elements you need to skip to get to the next row
                 // we need all elements of the jth column of b
-                // so we need to skip k * b.stride[0] elements every time
+                // so we need to skip k * b.stride(0) elements every time
                 // and then get the jth element
-                const rhs = b.data[k * b.stride[0] + j];
-                data[i * b.shape[1] + j] += lhs * rhs;
+                tempdata[j] = a.data[i * a.stride(0) + k] * b.data[k * b.stride(0) + j];
             }
+
+            for (0..b.shape[1]) |j| {
+                data[i * b.shape[1] + j] += tempdata[j];
+            }
+            // data[i * b.shape[1] + j] += a.data[i * a.stride(0) + k] * b.data[k * b.stride(0) + j];
         }
     }
 
-    const tens = tensor.Tensor(dtype).init(data, &[_]usize{ a.shape[0], b.shape[1] }, allocator) catch {
-        allocator.free(data);
-        return error.unimplemented;
-    };
-    allocator.free(data);
-    return tens;
+    return tensor.Tensor(dtype).init(data, new_shape);
+}
+
+test "mul loop_reorder" {
+    const allocator = std.testing.allocator;
+    const shape = &[_]usize{ 1024, 1024 };
+    const buffer = try allocator.alloc(f64, shape[0] * shape[1]);
+    defer allocator.free(buffer);
+
+    const a = try identity(f64, shape, buffer);
+    const b = try identity(f64, shape, buffer);
+
+    const c = try mul_loop_reorder(f64, a, b, allocator);
+    defer c.deinit(allocator);
+
+    try std.testing.expectEqualDeep(c.shape, shape);
+    try std.testing.expect(std.mem.eql(f64, a.data, c.data));
+    try std.testing.expect(std.mem.eql(f64, b.data, c.data));
 }
 
 pub fn mul_naive(comptime dtype: type, a: tensor.Tensor(dtype), b: tensor.Tensor(dtype), allocator: std.mem.Allocator) error{ dimension_mismatch, unimplemented, allocator_error }!tensor.Tensor(dtype) {
@@ -358,77 +275,50 @@ pub fn mul_naive(comptime dtype: type, a: tensor.Tensor(dtype), b: tensor.Tensor
         return error.unimplemented;
     }
 
+    const new_shape = allocator.alloc(usize, 2) catch return error.allocator_error;
+    new_shape[0] = a.shape[0];
+    new_shape[1] = b.shape[1];
+
     const output_length = a.shape[0] * b.shape[1];
     var data = allocator.alloc(dtype, output_length) catch return error.allocator_error;
-    @memset(data, 0);
+    // @memset(data, 0);
 
     // WE'RE DOING IT BABY
     for (0..a.shape[0]) |i| {
         for (0..b.shape[1]) |j| {
+            var sum: dtype = 0;
             for (0..a.shape[1]) |k| {
-                // a.stride[0] is how many elements you need to skip to get to the next row
-                // since we need the ith row of a, we need to skip i * a.stride[0] elements and then get the kth col
-                const lhs = a.data[i * a.stride[0] + k];
+                // a.stride(0) is how many elements you need to skip to get to the next row
+                // since we need the ith row of a, we need to skip i * a.stride(0) elements and then get the kth col
+                const lhs = a.data[i * a.stride(0) + k];
 
-                // b.stride[0] is how many elements you need to skip to get to the next row
+                // b.stride(0) is how many elements you need to skip to get to the next row
                 // we need all elements of the jth column of b
-                // so we need to skip k * b.stride[0] elements every time
+                // so we need to skip k * b.stride(0) elements every time
                 // and then get the jth element
-                const rhs = b.data[k * b.stride[0] + j];
-                data[i * b.shape[1] + j] += lhs * rhs;
+                const rhs = b.data[k * b.stride(0) + j];
+                sum += lhs * rhs;
             }
+            data[i * b.shape[1] + j] = sum;
         }
     }
 
-    const tens = tensor.Tensor(dtype).init(data, &[_]usize{ a.shape[0], b.shape[1] }, allocator) catch {
-        allocator.free(data);
-        return error.unimplemented;
-    };
-    allocator.free(data);
-    return tens;
+    return tensor.Tensor(dtype).init(data, new_shape);
 }
 
-test "mul" {
+test "mul naive" {
     const allocator = std.testing.allocator;
-    const shape = &[_]usize{ 3, 3 };
+    const shape = &[_]usize{ 1024, 1024 };
+    const buffer = try allocator.alloc(f64, shape[0] * shape[1]);
+    defer allocator.free(buffer);
 
-    const a = try arange(f32, 1, 10, shape, allocator);
-    defer a.deinit(allocator);
+    const a = try identity(f64, shape, buffer);
+    const b = try identity(f64, shape, buffer);
 
-    const b = try arange(f32, 1, 10, shape, allocator);
-    defer b.deinit(allocator);
-
-    const c = try mul(f32, a, b, allocator, .naive);
+    const c = try mul_naive(f64, a, b, allocator);
     defer c.deinit(allocator);
 
-    // assert dim is correct
-    try std.testing.expectEqualDeep(&[_]usize{ 3, 3 }, c.shape);
-
-    // assert values are correct
-    try std.testing.expectEqual(c.getitem(&[_]usize{ 0, 0 }), 30);
-    try std.testing.expectEqual(c.getitem(&[_]usize{ 0, 1 }), 36);
-    try std.testing.expectEqual(c.getitem(&[_]usize{ 0, 2 }), 42);
-    try std.testing.expectEqual(c.getitem(&[_]usize{ 1, 0 }), 66);
-    try std.testing.expectEqual(c.getitem(&[_]usize{ 1, 1 }), 81);
-    try std.testing.expectEqual(c.getitem(&[_]usize{ 1, 2 }), 96);
-    try std.testing.expectEqual(c.getitem(&[_]usize{ 2, 0 }), 102);
-    try std.testing.expectEqual(c.getitem(&[_]usize{ 2, 1 }), 126);
-    try std.testing.expectEqual(c.getitem(&[_]usize{ 2, 2 }), 150);
-}
-
-test "bigmul" {
-    const allocator = std.testing.allocator;
-    const shape = &[_]usize{ 1000, 1000 };
-
-    const a = try uniform(f64, shape, allocator);
-    defer a.deinit(allocator);
-
-    const b = try uniform(f64, shape, allocator);
-    defer b.deinit(allocator);
-
-    const c = try mul(f64, a, b, allocator);
-    defer c.deinit(allocator);
-
-    // assert dim is correct
-    try std.testing.expectEqualDeep(&[_]usize{ 1000, 1000 }, c.shape);
+    try std.testing.expectEqualDeep(c.shape, shape);
+    try std.testing.expect(std.mem.eql(f64, a.data, c.data));
+    try std.testing.expect(std.mem.eql(f64, b.data, c.data));
 }

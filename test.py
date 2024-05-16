@@ -52,20 +52,20 @@ def test_mul():
     torch_time = timeit.timeit(lambda: torch_lhs @ torch_rhs, number=n_iters)
     print(f"torch mul: {torch_time/10} seconds per iteration")
 
-    # match_time = timeit.timeit(
-    #     lambda: match.mul_f64(match_lhs, match_rhs, "naive"), number=n_iters
-    # )
-    # print(f"zig mul: {match_time/n_iters} seconds per iteration")
+    match_time = timeit.timeit(
+        lambda: match.mul_f64(match_lhs, match_rhs, "naive"), number=n_iters
+    )
+    print(f"zig mul: {match_time/n_iters} seconds per iteration")
 
-    # match_time = timeit.timeit(
-    #     lambda: match.mul_f64(match_lhs, match_rhs, "loop_reorder"), number=n_iters
-    # )
-    # print(f"zig mul (loop_reorder): {match_time/n_iters} seconds per iteration")
-    #
-    # match_time = timeit.timeit(
-    #     lambda: match.mul_f64(match_lhs, match_rhs, "simd"), number=n_iters
-    # )
-    # print(f"zig mul (simd): {match_time/n_iters} seconds per iteration")
+    match_time = timeit.timeit(
+        lambda: match.mul_f64(match_lhs, match_rhs, "loop_reorder"), number=n_iters
+    )
+    print(f"zig mul (loop_reorder): {match_time/n_iters} seconds per iteration")
+
+    match_time = timeit.timeit(
+        lambda: match.mul_f64(match_lhs, match_rhs, "simd"), number=n_iters
+    )
+    print(f"zig mul (simd): {match_time/n_iters} seconds per iteration")
     match_time = timeit.timeit(
         lambda: match.mul_f64(match_lhs, match_rhs, "simd_reorder"), number=n_iters
     )
