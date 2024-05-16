@@ -27,3 +27,18 @@ I ran 10 iterations of matrix multiplication with matrices of size 1024x1024. Th
 | zig mul (multithreaded_loop_reorder) | 0.05411136249895208 |
 | zig mul (multithreaded_simd) | 0.12674717499758117 |
 | zig mul (multithreaded_simd_reorder) | 0.023085283298860303 |
+
+Now as miliseconds, rounded to the closest milisecond:
+
+| strategy | milliseconds per iteration|
+| -------- | ------------------------- |
+| numpy | 16.3 |
+| torch | 1.5 |
+| zig mul (naive) | 937 |
+| zig mul (loop_reorder) | 455 |
+| zig mul (simd) | 911 |
+| zig mul (simd_reorder) | 163 |
+| zig mul (naive_multithreaded) | 135 |
+| zig mul (multithreaded_loop_reorder) | 54 |
+| zig mul (multithreaded_simd) | 127 |
+| zig mul (multithreaded_simd_reorder) | 23 |
