@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const Error = error{dimension_mismatch};
+
 fn Tensor(comptime T: type) type {
     return struct {
         data: []T, // pointer (usize) and a length (usize) = 16 bytes
