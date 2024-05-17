@@ -1,7 +1,14 @@
 const tensor = @import("tensor.zig");
+
 const std = @import("std");
 
-const Error = error{ dimension_mismatch, unimplemented, allocator_error };
+// const Error = error{ dimension_mismatch, unimplemented, allocator_error };
+
+const MultiplicationError = error{
+    dimension_mismatch,
+    unimplemented,
+    allocation_error,
+};
 
 pub const MulStrategy = enum {
     naive,
@@ -15,7 +22,7 @@ pub const MulStrategy = enum {
     multithreaded_tiled,
 };
 
-pub fn uniform(comptime dtype: type, shape: []const usize, buffer: []dtype) !tensor.Tensor(dtype) {
+pub fn uniform(comptime dtype: type, shape: []const usize, buffer: []dtype) error{dimension_mismatch}!tensor.Tensor(dtype) {
     var rng = std.rand.DefaultPrng.init(0);
     var r = rng.random();
     for (0..buffer.len) |i| {
@@ -332,7 +339,7 @@ test "mul naive" {
     try std.testing.expect(std.mem.eql(f64, b.data, c.data));
 }
 
-fn mul_naive_multithreaded_worker(comptime dtype: type, a: *const tensor.Tensor(f64), b: *const tensor.Tensor(f64), data: []dtype, i: usize) void {
+fn mul_naive_multithreaded_worker(comptime dtype: type, a: *const tensor.Tensor(dtype), b: *const tensor.Tensor(dtype), data: []dtype, i: usize) void {
     for (0..b.shape[1]) |j| {
         var sum: dtype = 0;
         for (0..a.shape[1]) |k| {
@@ -396,7 +403,7 @@ test "mul naive_multithreaded" {
     try std.testing.expect(std.mem.eql(f64, b.data, c.data));
 }
 
-fn mul_multithreaded_loop_reorder_worker(comptime dtype: type, a: *const tensor.Tensor(f64), b: *const tensor.Tensor(f64), data: []dtype, i: usize) void {
+fn mul_multithreaded_loop_reorder_worker(comptime dtype: type, a: *const tensor.Tensor(dtype), b: *const tensor.Tensor(dtype), data: []dtype, i: usize) void {
     var tempdata = [_]dtype{0} ** std.math.maxInt(u16);
     for (0..a.shape[1]) |k| {
         // initialize a slice of length b.shape[1]
@@ -494,7 +501,7 @@ pub fn mul_multithreaded_simd(comptime dtype: type, a: tensor.Tensor(dtype), b: 
     return tensor.Tensor(dtype).init(data, new_shape);
 }
 
-fn mul_multithreaded_simd_worker(comptime dtype: type, a: *const tensor.Tensor(f64), b: *const tensor.Tensor(f64), data: []dtype, i: usize) void {
+fn mul_multithreaded_simd_worker(comptime dtype: type, a: *const tensor.Tensor(dtype), b: *const tensor.Tensor(dtype), data: []dtype, i: usize) void {
     const n_vec: usize = a.shape[0] / 8; // how many SIMD products we do per row of a / col of b
     // const remainder: usize = a.shape[0] % 8; // how many elements are left over
     //
@@ -576,14 +583,10 @@ fn mul_multithreaded_simd_reorder(comptime dtype: type, a: tensor.Tensor(dtype),
 
     // iterate over rows of A
     for (0..a.shape[0]) |i| {
-        pool.spawn(mul_multithreaded_simd_reorder_worker, .{ @Vector(8, dtype), &a, &b, data, i }) catch return error.allocator_error;
+        pool.spawn(mul_multithreaded_simd_reorder_worker, .{ @Vector(8, dtype), dtype, &a, &b, data, i }) catch return error.allocator_error;
     }
 
     pool.deinit();
-
-    // for (pool.threads) |thread| {
-    //     thread.join();
-    // }
 
     for (0..a.shape[0]) |i| {
         for (0..n_vec) |j| {
@@ -598,18 +601,17 @@ fn mul_multithreaded_simd_reorder(comptime dtype: type, a: tensor.Tensor(dtype),
     return tensor.Tensor(dtype).init(ret, new_shape);
 }
 
-fn mul_multithreaded_simd_reorder_worker(comptime dtype: type, a: *const tensor.Tensor(f64), b: *const tensor.Tensor(f64), data: []dtype, i: usize) void {
+fn mul_multithreaded_simd_reorder_worker(comptime vector_dtype: type, comptime tensor_dtype: type, a: *const tensor.Tensor(tensor_dtype), b: *const tensor.Tensor(tensor_dtype), data: []vector_dtype, i: usize) void {
     const n_vec: usize = b.shape[1] / 8; // how many SIMD products we do per row of a / col of b
     for (0..a.shape[1]) |k| {
-        const lhs: dtype = @splat(a.data[i * a.stride(0) + k]);
+        const lhs: vector_dtype = @splat(a.data[i * a.stride(0) + k]);
         // iterate over the kth row of B, chunk, and scalar multiply, then add to the ith row of C
         for (0..n_vec) |j| {
             // we want the jth group of 8 elements of the kth row of B
             // kth row of B is k * b.stride(0)
             // jth group of 8 elements is j * 8
-            const rhs: dtype = b.data[(k * b.stride(0) + j * 8)..][0..8].*;
+            const rhs: vector_dtype = b.data[(k * b.stride(0) + j * 8)..][0..8].*;
 
-            // TODO need to lock this, but i dont know what to do yet
             data[i * n_vec + j] += lhs * rhs;
         }
     }
@@ -637,7 +639,7 @@ test "mul multithreaded_simd_reorder" {
 
 const TILE_SIZE = 32;
 
-fn mul_multithreaded_tiled_worker_inner(comptime dtype: type, a: *const tensor.Tensor(f64), b: *const tensor.Tensor(f64), data: []dtype, row_tile_idx: usize, col_tile_idx: usize) void {
+fn mul_multithreaded_tiled_worker_inner(comptime dtype: type, a: *const tensor.Tensor(dtype), b: *const tensor.Tensor(dtype), data: []dtype, row_tile_idx: usize, col_tile_idx: usize) void {
     const row_tile_start = row_tile_idx * TILE_SIZE;
     const col_tile_start = col_tile_idx * TILE_SIZE;
     for (row_tile_start..row_tile_start + TILE_SIZE) |i| {
@@ -649,7 +651,7 @@ fn mul_multithreaded_tiled_worker_inner(comptime dtype: type, a: *const tensor.T
     }
 }
 
-fn mul_multithreaded_tiled_worker_outer(comptime dtype: type, a: *const tensor.Tensor(f64), b: *const tensor.Tensor(f64), data: []dtype, row_tile_idx: usize, pool: *std.Thread.Pool) void {
+fn mul_multithreaded_tiled_worker_outer(comptime dtype: type, a: *const tensor.Tensor(dtype), b: *const tensor.Tensor(dtype), data: []dtype, row_tile_idx: usize, pool: *std.Thread.Pool) void {
     const n_tiles: usize = a.shape[0] / TILE_SIZE;
     for (0..n_tiles) |col_tile_idx| {
         pool.spawn(mul_multithreaded_tiled_worker_inner, .{

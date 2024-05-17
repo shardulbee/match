@@ -8,10 +8,10 @@ import torch as t
 
 
 def test_mul():
-    shape = (4096, 4096)
+    shape = (1024, 1024)
 
-    match_lhs = match.uniform_f64(shape)
-    match_rhs = match.uniform_f64(shape)
+    match_lhs = match.uniform_f32(shape)
+    match_rhs = match.uniform_f32(shape)
 
     numpy_lhs = np.random.uniform(0, 1, shape)
     numpy_rhs = np.random.uniform(0, 1, shape)
@@ -47,7 +47,7 @@ def test_mul():
         if strategy == "multithreaded_naive":
             strategy = "naive_multithreaded"
         match_time = timeit.timeit(
-            lambda: match.mul_f64(match_lhs, match_rhs, strategy), number=n_iters
+            lambda: match.mul_f32(match_lhs, match_rhs, strategy), number=n_iters
         )
         print(f"zig mul ({strategy}): {match_time/n_iters} seconds per iteration")
 
