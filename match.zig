@@ -203,6 +203,8 @@ pub fn mul_f64(_: [*c]PyObject, args: [*c]PyObject) callconv(.C) [*c]PyObject {
         strategy_arg = match_impl.MulStrategy.multithreaded_simd;
     } else if (std.mem.eql(u8, strategy_str[0..length], "multithreaded_simd_reorder")) {
         strategy_arg = match_impl.MulStrategy.multithreaded_simd_reorder;
+    } else if (std.mem.eql(u8, strategy_str[0..length], "multithreaded_tiled")) {
+        strategy_arg = match_impl.MulStrategy.multithreaded_tiled;
     } else {
         py.PyErr_SetString(py.PyExc_ValueError, "strategy must be 'naive' or 'loop_reorder'");
         return null;

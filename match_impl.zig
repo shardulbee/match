@@ -12,6 +12,7 @@ pub const MulStrategy = enum {
     multithreaded_loop_reorder,
     multithreaded_simd,
     multithreaded_simd_reorder,
+    multithreaded_tiled,
 };
 
 pub fn uniform(comptime dtype: type, shape: []const usize, buffer: []dtype) !tensor.Tensor(dtype) {
@@ -65,6 +66,7 @@ pub fn mul(comptime dtype: type, a: tensor.Tensor(dtype), b: tensor.Tensor(dtype
         .multithreaded_loop_reorder => return mul_multithreaded_loop_reorder(dtype, a, b, allocator),
         .multithreaded_simd => return mul_multithreaded_simd(dtype, a, b, allocator),
         .multithreaded_simd_reorder => return mul_multithreaded_simd_reorder(dtype, a, b, allocator),
+        .multithreaded_tiled => return mul_tiled(dtype, a, b, allocator),
     }
 }
 
@@ -368,11 +370,11 @@ pub fn mul_naive_multithreaded(comptime dtype: type, a: tensor.Tensor(dtype), b:
 
     var pool: std.Thread.Pool = undefined;
     pool.init(.{ .allocator = allocator }) catch return error.allocator_error;
-    defer pool.deinit();
 
     for (0..a.shape[0]) |i| {
         pool.spawn(mul_naive_multithreaded_worker, .{ dtype, &a, &b, data, i }) catch return error.allocator_error;
     }
+    pool.deinit();
 
     return tensor.Tensor(dtype).init(data, new_shape);
 }
@@ -436,11 +438,11 @@ pub fn mul_multithreaded_loop_reorder(comptime dtype: type, a: tensor.Tensor(dty
 
     var pool: std.Thread.Pool = undefined;
     pool.init(.{ .allocator = allocator }) catch return error.allocator_error;
-    defer pool.deinit();
 
     for (0..a.shape[0]) |i| {
         pool.spawn(mul_multithreaded_loop_reorder_worker, .{ dtype, &a, &b, data, i }) catch return error.allocator_error;
     }
+    pool.deinit();
 
     return tensor.Tensor(dtype).init(data, new_shape);
 }
@@ -483,11 +485,11 @@ pub fn mul_multithreaded_simd(comptime dtype: type, a: tensor.Tensor(dtype), b: 
 
     var pool: std.Thread.Pool = undefined;
     pool.init(.{ .allocator = allocator }) catch return error.allocator_error;
-    defer pool.deinit();
 
     for (0..a.shape[0]) |i| {
         pool.spawn(mul_multithreaded_simd_worker, .{ dtype, &a, &b, data, i }) catch return error.allocator_error;
     }
+    pool.deinit();
 
     return tensor.Tensor(dtype).init(data, new_shape);
 }
@@ -630,5 +632,89 @@ test "mul multithreaded_simd_reorder" {
     try std.testing.expectEqualDeep(c.shape, shape);
     try std.testing.expectEqualDeep(a.data, c.data);
     // try std.testing.expect(std.mem.eql(f64, a.data, c.data));
+    try std.testing.expect(std.mem.eql(f64, b.data, c.data));
+}
+
+const TILE_SIZE = 32;
+
+fn mul_multithreaded_tiled_worker_inner(comptime dtype: type, a: *const tensor.Tensor(f64), b: *const tensor.Tensor(f64), data: []dtype, row_tile_idx: usize, col_tile_idx: usize) void {
+    const row_tile_start = row_tile_idx * TILE_SIZE;
+    const col_tile_start = col_tile_idx * TILE_SIZE;
+    for (row_tile_start..row_tile_start + TILE_SIZE) |i| {
+        for (0..a.shape[1]) |k| {
+            for (col_tile_start..col_tile_start + TILE_SIZE) |j| {
+                data[i * b.shape[1] + j] += a.data[i * a.stride(0) + k] * b.data[k * b.stride(0) + j];
+            }
+        }
+    }
+}
+
+fn mul_multithreaded_tiled_worker_outer(comptime dtype: type, a: *const tensor.Tensor(f64), b: *const tensor.Tensor(f64), data: []dtype, row_tile_idx: usize, pool: *std.Thread.Pool) void {
+    const n_tiles: usize = a.shape[0] / TILE_SIZE;
+    for (0..n_tiles) |col_tile_idx| {
+        pool.spawn(mul_multithreaded_tiled_worker_inner, .{
+            dtype,
+            a,
+            b,
+            data,
+            row_tile_idx,
+            col_tile_idx,
+        }) catch return;
+    }
+}
+
+// everything in here is parallelized
+
+fn mul_tiled(comptime dtype: type, a: tensor.Tensor(dtype), b: tensor.Tensor(dtype), allocator: std.mem.Allocator) error{ dimension_mismatch, unimplemented, allocator_error }!tensor.Tensor(dtype) {
+    if (a.shape[a.shape.len - 1] != b.shape[0]) {
+        return error.dimension_mismatch;
+    }
+
+    if (a.shape.len != 2 or b.shape.len != 2) {
+        return error.unimplemented;
+    }
+
+    const new_shape = allocator.alloc(usize, 2) catch return error.allocator_error;
+    new_shape[0] = a.shape[0];
+    new_shape[1] = b.shape[1];
+
+    const output_length = a.shape[0] * b.shape[1];
+    const data = allocator.alloc(dtype, output_length) catch return error.allocator_error;
+    @memset(data, 0);
+    var pool: std.Thread.Pool = undefined;
+    pool.init(.{ .allocator = allocator }) catch return error.allocator_error;
+
+    const n_tiles: usize = a.shape[0] / TILE_SIZE;
+
+    for (0..n_tiles) |row_tile_idx| {
+        pool.spawn(mul_multithreaded_tiled_worker_outer, .{
+            dtype,
+            &a,
+            &b,
+            data,
+            row_tile_idx,
+            &pool,
+        }) catch return error.allocator_error;
+    }
+    pool.deinit();
+
+    return tensor.Tensor(dtype).init(data, new_shape);
+}
+
+test "mul tiled" {
+    const allocator = std.testing.allocator;
+
+    const shape = &[_]usize{ 1024, 1024 };
+    const buffer = try allocator.alloc(f64, shape[0] * shape[1]);
+    defer allocator.free(buffer);
+
+    const a = try identity(f64, shape, buffer);
+    const b = try identity(f64, shape, buffer);
+
+    const c = try mul_tiled(f64, a, b, allocator);
+    defer c.deinit(allocator);
+
+    try std.testing.expectEqualDeep(c.shape, shape);
+    try std.testing.expect(std.mem.eql(f64, a.data, c.data));
     try std.testing.expect(std.mem.eql(f64, b.data, c.data));
 }
