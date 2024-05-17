@@ -1,12 +1,7 @@
 const std = @import("std");
 
 const Error = error{dimension_mismatch};
-
-pub fn double(comptime T: type, val: T) T {
-    return val * 2;
-}
-
-pub fn Tensor(comptime T: type) type {
+fn Tensor(comptime T: type) type {
     return struct {
         data: []T, // pointer (usize) and a length (usize) = 16 bytes
         shape: []const usize, // pointer (usize) and a length (usize) = 16
@@ -90,14 +85,4 @@ pub fn Tensor(comptime T: type) type {
             return std.mem.eql(T, self.data, other.data);
         }
     };
-}
-
-test "apply" {
-    const shape: [2]usize = [2]usize{ 10, 1 };
-    const buffer: [10]f32 = [_]f32{1} ** 10;
-    const a = try Tensor(f32).init(buffer[0..10], shape[0..1]);
-    const expected: [10]f32 = [_]f32{2} ** 10;
-
-    const b = a.apply(double);
-    try std.testing.expectEqualDeep(expected[0..10], b.data);
 }
