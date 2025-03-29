@@ -1,7 +1,5 @@
 # `match`
 
-![header](header.webp)
-
 `match` is a re-implementation of a subset of the PyTorch API in Zig. The goal was to learn more about a variety of topics with a small project. This includes:
 
 - writing a native Python extension
